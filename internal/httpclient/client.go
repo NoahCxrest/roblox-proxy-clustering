@@ -140,11 +140,12 @@ func (c *Client) FetchJSON(ctx context.Context, host, path string, query url.Val
 	headers := make(http.Header, 2)
 	headers.Set("Accept", "application/json")
 	resp, err := c.Forward(ctx, &ForwardRequest{
-		Method:     http.MethodGet,
-		RobloxHost: host,
-		Path:       path,
-		RawQuery:   query.Encode(),
-		Header:     headers,
+		Method:       http.MethodGet,
+		RobloxHost:   host,
+		Path:         path,
+		UpstreamPath: clusterPath(host, path),
+		RawQuery:     query.Encode(),
+		Header:       headers,
 	})
 	if err != nil {
 		return err
@@ -205,4 +206,19 @@ func parseIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+// clusterPath maps Roblox hosts onto the member-friendly /{service}/... routing form.
+func clusterPath(host, path string) string {
+	idx := strings.IndexByte(host, '.')
+	prefix := host
+	if idx > 0 {
+		prefix = host[:idx]
+	}
+
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "/" + prefix
+	}
+	return "/" + prefix + "/" + trimmed
 }
