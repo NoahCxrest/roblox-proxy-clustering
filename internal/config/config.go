@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -155,14 +157,23 @@ func SendDiscordWebhook(webhookURL, message string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, strings.NewReader(message))
+	payload := map[string]interface{}{
+		"username": "RobloxProxyCluster",
+		"content":  message,
+	}
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	req.Header.Set("Content-Type", "text/plain")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(data))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
