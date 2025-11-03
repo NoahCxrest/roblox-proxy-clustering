@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -23,9 +24,10 @@ import (
 
 const (
 	userProfileCacheTTLSeconds = 18000 // 5 hours
-	searchCacheTTLSeconds      = 3600  // 1 hour
 	avatarCacheTTLSeconds      = 3600
 	maxProxyBodyBytes          = 4 << 20 // 4 MiB
+	cacheTimestampSuffix       = ":ts"
+	staleRepopulateAfter       = 5 * time.Hour
 )
 
 var (
@@ -98,47 +100,33 @@ func (s *Server) handleUserProfile(w http.ResponseWriter, r *http.Request, userI
 
 	ctx := r.Context()
 	cacheKey := "roblox:user:" + userID
-	if cached, err := s.cache.Get(ctx, cacheKey); err == nil && len(cached) > 0 {
-		s.writeJSONBytes(w, http.StatusOK, cached, userProfileCacheTTLSeconds)
-		return
-	} else if err != nil {
+	entry, err := s.loadCacheEntry(ctx, cacheKey)
+	if err != nil {
 		s.logger.WarnContext(ctx, "cache lookup failed", slog.String("key", cacheKey), slog.Any("err", err))
 	}
+	if len(entry.payload) > 0 {
+		if cacheStale(entry.fetchedAt) {
+			s.refreshUserProfileCache(userID, cacheKey)
+		}
+		s.writeJSONBytes(w, http.StatusOK, entry.payload, userProfileCacheTTLSeconds)
+		return
+	}
 
-	var userResp robloxUserResponse
-	if err := s.client.FetchJSON(ctx, "users.roblox.com", fmt.Sprintf("/v1/users/%s", userID), nil, &userResp); err != nil {
+	profile, err := s.fetchUserProfile(ctx, userID)
+	if err != nil {
 		s.logger.ErrorContext(ctx, "user lookup failed", slog.String("userId", userID), slog.Any("err", err))
 		s.writeJSONError(w, upstreamStatus(err), "Failed to fetch user information")
 		return
 	}
 
-	avatarURL, err := s.fetchAvatarURL(ctx, userID)
-	if err != nil {
-		s.logger.WarnContext(ctx, "avatar fetch failed", slog.String("userId", userID), slog.Any("err", err))
-		avatarURL = ""
-	}
-
-	combined := combinedUserResponse{
-		Description: userResp.Description,
-		Created:     userResp.Created,
-		IsBanned:    userResp.IsBanned,
-		ID:          userResp.ID,
-		Name:        userResp.Name,
-		DisplayName: userResp.DisplayName,
-		AvatarURL:   avatarURL,
-	}
-
-	payload, err := json.Marshal(combined)
+	payload, err := json.Marshal(profile)
 	if err != nil {
 		s.logger.ErrorContext(ctx, "failed to marshal user payload", slog.String("userId", userID), slog.Any("err", err))
 		s.writeJSONError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
-	if err := s.cache.Set(ctx, cacheKey, payload, userProfileCacheTTLSeconds); err != nil {
-		s.logger.WarnContext(ctx, "cache write failed", slog.String("key", cacheKey), slog.Any("err", err))
-	}
-
+	s.persistCacheEntry(context.Background(), cacheKey, payload, time.Now().UTC())
 	s.writeJSONBytes(w, http.StatusOK, payload, userProfileCacheTTLSeconds)
 }
 
@@ -156,66 +144,28 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, search str
 
 	ctx := r.Context()
 	cacheKey := "roblox:search:" + strings.ToLower(trimmed)
-	if cached, err := s.cache.Get(ctx, cacheKey); err == nil && len(cached) > 0 {
-		s.writeJSONBytes(w, http.StatusOK, cached, 0)
-		return
-	} else if err != nil {
+	entry, err := s.loadCacheEntry(ctx, cacheKey)
+	if err != nil {
 		s.logger.WarnContext(ctx, "cache lookup failed", slog.String("key", cacheKey), slog.Any("err", err))
 	}
-
-	var searchResp robloxSearchResponse
-	query := url.Values{
-		"verticalType":    {"user"},
-		"searchQuery":     {trimmed},
-		"globalSessionId": {"TridentBot"},
-		"sessionId":       {"TridentBot"},
+	if len(entry.payload) > 0 {
+		if cacheStale(entry.fetchedAt) {
+			s.refreshSearchCache(trimmed, cacheKey)
+		}
+		s.writeJSONBytes(w, http.StatusOK, entry.payload, 0)
+		return
 	}
 
-	if err := s.client.FetchJSON(ctx, "apis.roblox.com", "/search-api/omni-search", query, &searchResp); err != nil {
+	results, err := s.fetchSearchResults(ctx, trimmed)
+	if err != nil {
+		var assembleErr *searchAssemblyError
+		if errors.As(err, &assembleErr) {
+			s.logger.ErrorContext(ctx, "search assembly failed", slog.String("search", trimmed), slog.Any("err", assembleErr.err))
+			s.writeJSONError(w, http.StatusInternalServerError, "Internal Server Error")
+			return
+		}
 		s.logger.ErrorContext(ctx, "search fetch failed", slog.String("search", trimmed), slog.Any("err", err))
 		s.writeJSONError(w, upstreamStatus(err), "Failed to fetch data from Roblox API")
-		return
-	}
-
-	contents := searchResp.FirstContents()
-	if len(contents) == 0 {
-		s.writeJSONBytes(w, http.StatusOK, []byte("[]"), 0)
-		return
-	}
-
-	results := make([]searchResult, len(contents))
-	group, groupCtx := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, 6)
-
-	for i := range contents {
-		i := i
-		entry := contents[i]
-		group.Go(func() error {
-			select {
-			case sem <- struct{}{}:
-			case <-groupCtx.Done():
-				return groupCtx.Err()
-			}
-			defer func() { <-sem }()
-
-			avatarURL, err := s.fetchAvatarURL(groupCtx, strconv.FormatInt(entry.ContentID, 10))
-			if err != nil {
-				s.logger.WarnContext(groupCtx, "avatar fetch failed", slog.Int64("contentId", entry.ContentID), slog.Any("err", err))
-				avatarURL = ""
-			}
-
-			results[i] = searchResult{
-				PlayerID:  strconv.FormatInt(entry.ContentID, 10),
-				Name:      entry.Username,
-				AvatarURL: avatarURL,
-			}
-			return nil
-		})
-	}
-
-	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		s.logger.ErrorContext(ctx, "search assembly failed", slog.String("search", trimmed), slog.Any("err", err))
-		s.writeJSONError(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}
 
@@ -226,10 +176,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, search str
 		return
 	}
 
-	if err := s.cache.Set(ctx, cacheKey, payload, searchCacheTTLSeconds); err != nil {
-		s.logger.WarnContext(ctx, "cache write failed", slog.String("key", cacheKey), slog.Any("err", err))
-	}
-
+	s.persistCacheEntry(context.Background(), cacheKey, payload, time.Now().UTC())
 	s.writeJSONBytes(w, http.StatusOK, payload, 0)
 }
 
@@ -287,6 +234,208 @@ func (s *Server) handleTransparentProxy(w http.ResponseWriter, r *http.Request) 
 	if _, err := io.CopyBuffer(w, resp.Body, make([]byte, 32*1024)); err != nil {
 		s.logger.WarnContext(r.Context(), "error streaming upstream response", slog.Any("err", err))
 	}
+}
+
+func (s *Server) loadCacheEntry(ctx context.Context, key string) (cacheEntry, error) {
+	payload, err := s.cache.Get(ctx, key)
+	if err != nil {
+		return cacheEntry{}, err
+	}
+
+	entry := cacheEntry{payload: payload}
+	if len(payload) == 0 {
+		return entry, nil
+	}
+
+	tsBytes, err := s.cache.Get(ctx, cacheTimestampKey(key))
+	if err != nil {
+		s.logger.WarnContext(ctx, "cache timestamp lookup failed", slog.String("key", cacheTimestampKey(key)), slog.Any("err", err))
+		return entry, nil
+	}
+
+	if len(tsBytes) == 0 {
+		return entry, nil
+	}
+
+	ts, err := strconv.ParseInt(string(tsBytes), 10, 64)
+	if err != nil {
+		s.logger.WarnContext(ctx, "cache timestamp parse failed", slog.String("key", cacheTimestampKey(key)), slog.Any("err", err))
+		return entry, nil
+	}
+
+	if ts > 0 {
+		entry.fetchedAt = time.Unix(ts, 0).UTC()
+	}
+
+	return entry, nil
+}
+
+func (s *Server) persistCacheEntry(ctx context.Context, key string, payload []byte, fetchedAt time.Time) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if err := s.cache.Set(ctx, key, payload, 0); err != nil {
+		s.logger.WarnContext(ctx, "cache write failed", slog.String("key", key), slog.Any("err", err))
+	}
+
+	tsKey := cacheTimestampKey(key)
+	tsValue := []byte(strconv.FormatInt(fetchedAt.UTC().Unix(), 10))
+	if err := s.cache.Set(ctx, tsKey, tsValue, 0); err != nil {
+		s.logger.WarnContext(ctx, "cache timestamp write failed", slog.String("key", tsKey), slog.Any("err", err))
+	}
+}
+
+func cacheTimestampKey(key string) string {
+	return key + cacheTimestampSuffix
+}
+
+func cacheStale(fetchedAt time.Time) bool {
+	if fetchedAt.IsZero() {
+		return true
+	}
+	return time.Since(fetchedAt) >= staleRepopulateAfter
+}
+
+func (s *Server) refreshUserProfileCache(userID, cacheKey string) {
+	go func() {
+		ctx := context.Background()
+		profile, err := s.fetchUserProfile(ctx, userID)
+		if err != nil {
+			s.logger.WarnContext(ctx, "user cache refresh failed", slog.String("userId", userID), slog.Any("err", err))
+			return
+		}
+
+		payload, err := json.Marshal(profile)
+		if err != nil {
+			s.logger.WarnContext(ctx, "user cache marshal failed", slog.String("userId", userID), slog.Any("err", err))
+			return
+		}
+
+		s.persistCacheEntry(ctx, cacheKey, payload, time.Now().UTC())
+	}()
+}
+
+func (s *Server) refreshSearchCache(searchTerm, cacheKey string) {
+	go func() {
+		ctx := context.Background()
+		results, err := s.fetchSearchResults(ctx, searchTerm)
+		if err != nil {
+			var assembleErr *searchAssemblyError
+			if errors.As(err, &assembleErr) {
+				s.logger.WarnContext(ctx, "search cache assembly failed", slog.String("search", searchTerm), slog.Any("err", assembleErr.err))
+			} else {
+				s.logger.WarnContext(ctx, "search cache fetch failed", slog.String("search", searchTerm), slog.Any("err", err))
+			}
+			return
+		}
+
+		payload, err := json.Marshal(results)
+		if err != nil {
+			s.logger.WarnContext(ctx, "search cache marshal failed", slog.String("search", searchTerm), slog.Any("err", err))
+			return
+		}
+
+		s.persistCacheEntry(ctx, cacheKey, payload, time.Now().UTC())
+	}()
+}
+
+func (s *Server) fetchUserProfile(ctx context.Context, userID string) (combinedUserResponse, error) {
+	var userResp robloxUserResponse
+	if err := s.client.FetchJSON(ctx, "users.roblox.com", fmt.Sprintf("/v1/users/%s", userID), nil, &userResp); err != nil {
+		return combinedUserResponse{}, err
+	}
+
+	avatarURL, err := s.fetchAvatarURL(ctx, userID)
+	if err != nil {
+		s.logger.WarnContext(ctx, "avatar fetch failed", slog.String("userId", userID), slog.Any("err", err))
+		avatarURL = ""
+	}
+
+	return combinedUserResponse{
+		Description: userResp.Description,
+		Created:     userResp.Created,
+		IsBanned:    userResp.IsBanned,
+		ID:          userResp.ID,
+		Name:        userResp.Name,
+		DisplayName: userResp.DisplayName,
+		AvatarURL:   avatarURL,
+	}, nil
+}
+
+func (s *Server) fetchSearchResults(ctx context.Context, searchTerm string) ([]searchResult, error) {
+	var searchResp robloxSearchResponse
+	query := url.Values{
+		"verticalType":    {"user"},
+		"searchQuery":     {searchTerm},
+		"globalSessionId": {"TridentBot"},
+		"sessionId":       {"TridentBot"},
+	}
+
+	if err := s.client.FetchJSON(ctx, "apis.roblox.com", "/search-api/omni-search", query, &searchResp); err != nil {
+		return nil, err
+	}
+
+	contents := searchResp.FirstContents()
+	if len(contents) == 0 {
+		return []searchResult{}, nil
+	}
+
+	results := make([]searchResult, len(contents))
+	group, groupCtx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, 6)
+
+	for i := range contents {
+		i := i
+		entry := contents[i]
+		group.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-groupCtx.Done():
+				return groupCtx.Err()
+			}
+			defer func() { <-sem }()
+
+			avatarURL, err := s.fetchAvatarURL(groupCtx, strconv.FormatInt(entry.ContentID, 10))
+			if err != nil {
+				s.logger.WarnContext(groupCtx, "avatar fetch failed", slog.Int64("contentId", entry.ContentID), slog.Any("err", err))
+				avatarURL = ""
+			}
+
+			results[i] = searchResult{
+				PlayerID:  strconv.FormatInt(entry.ContentID, 10),
+				Name:      entry.Username,
+				AvatarURL: avatarURL,
+			}
+			return nil
+		})
+	}
+
+	if err := group.Wait(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return results, nil
+		}
+		return nil, &searchAssemblyError{err: err}
+	}
+
+	return results, nil
+}
+
+type cacheEntry struct {
+	payload   []byte
+	fetchedAt time.Time
+}
+
+type searchAssemblyError struct {
+	err error
+}
+
+func (e *searchAssemblyError) Error() string {
+	return fmt.Sprintf("search assembly failed: %v", e.err)
+}
+
+func (e *searchAssemblyError) Unwrap() error {
+	return e.err
 }
 
 func (s *Server) fetchAvatarURL(ctx context.Context, userID string) (string, error) {
