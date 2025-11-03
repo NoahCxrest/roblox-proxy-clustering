@@ -174,6 +174,8 @@ func SendDiscordWebhook(webhookURL, message string) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "insomnia/12.0.0")
+	req.Header.Set("Cookie", "_cfuvid=uBby2BFN9MqDfL8GXV_aLQ.thOyJ9RfLnm5t_.qgnsQ-1762211806739-0.0.1.1-604800000; __dcfduid=6b6b51da555111f0aab7f6f929b18531; __sdcfduid=6b6b51da555111f0aab7f6f929b18531bf34298ef3b98224ff0a8076e036d42f23a91a41f51bef24d248359a7fe2eecf; __cfruid=3b37520992bd7f8c546c61dd762c2e14b40e6279-1757981255")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
