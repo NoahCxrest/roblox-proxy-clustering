@@ -85,6 +85,9 @@ func parseTargets(input string) ([]*url.URL, error) {
 		if candidate == "" {
 			continue
 		}
+		if !strings.Contains(candidate, "://") {
+			candidate = "https://" + candidate
+		}
 		u, err := url.Parse(candidate)
 		if err != nil {
 			return nil, fmt.Errorf("invalid cluster target %q: %w", candidate, err)
