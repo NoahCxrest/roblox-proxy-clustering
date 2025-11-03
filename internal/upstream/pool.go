@@ -2,26 +2,32 @@ package upstream
 
 import (
 	"net/url"
+	"strings"
 	"sync/atomic"
 )
 
 // Target represents a single upstream cluster endpoint.
 type Target struct {
-	base *url.URL
-}
-
-// URL returns a cloned url.URL for safe mutation by callers.
-func (t *Target) URL() *url.URL {
-	clone := *t.base
-	return &clone
+	base         *url.URL
+	direct       bool
+	directScheme string
 }
 
 // Resolve returns a fully-qualified URL assembled from the upstream base, path, and query string.
-func (t *Target) Resolve(path, rawQuery string) *url.URL {
-	u := t.URL()
+func (t *Target) Resolve(host, path, rawQuery string) *url.URL {
+	if t.direct {
+		return &url.URL{
+			Scheme:   t.directScheme,
+			Host:     host,
+			Path:     ensureLeadingSlash(path),
+			RawQuery: rawQuery,
+		}
+	}
+
+	u := *t.base
 	u.Path = joinURLPath(u.Path, path)
 	u.RawQuery = rawQuery
-	return u
+	return &u
 }
 
 // Pool implements a lock-free round-robin selector over upstream targets.
@@ -34,8 +40,15 @@ type Pool struct {
 func NewPool(urls []*url.URL) *Pool {
 	targets := make([]*Target, len(urls))
 	for i, u := range urls {
-		clone := *u
-		targets[i] = &Target{base: &clone}
+		target := &Target{}
+		if isDirect(u.Scheme) {
+			target.direct = true
+			target.directScheme = directScheme(u)
+		} else {
+			clone := *u
+			target.base = &clone
+		}
+		targets[i] = target
 	}
 	return &Pool{targets: targets}
 }
@@ -78,4 +91,15 @@ func ensureLeadingSlash(path string) string {
 		return "/" + path
 	}
 	return path
+}
+
+func isDirect(scheme string) bool {
+	return strings.EqualFold(scheme, "direct") || strings.EqualFold(scheme, "origin")
+}
+
+func directScheme(u *url.URL) string {
+	if v := strings.TrimSpace(u.Query().Get("scheme")); v != "" {
+		return v
+	}
+	return "https"
 }

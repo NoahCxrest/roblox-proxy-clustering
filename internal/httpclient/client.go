@@ -93,7 +93,7 @@ func (c *Client) Forward(ctx context.Context, req *ForwardRequest) (*http.Respon
 	}
 
 	target := c.pool.Next()
-	resolved := target.Resolve(req.Path, req.RawQuery)
+	resolved := target.Resolve(req.RobloxHost, req.Path, req.RawQuery)
 
 	ctx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()

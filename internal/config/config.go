@@ -92,10 +92,10 @@ func parseTargets(input string) ([]*url.URL, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid cluster target %q: %w", candidate, err)
 		}
-		if u.Scheme != "https" && u.Scheme != "http" {
-			return nil, fmt.Errorf("cluster target %q must include http or https scheme", candidate)
+		if u.Scheme != "https" && u.Scheme != "http" && !isDirectScheme(u.Scheme) {
+			return nil, fmt.Errorf("cluster target %q must include http/https or use direct://", candidate)
 		}
-		if u.Host == "" {
+		if !isDirectScheme(u.Scheme) && u.Host == "" {
 			return nil, fmt.Errorf("cluster target %q must include host", candidate)
 		}
 		parsed = append(parsed, u)
@@ -113,4 +113,8 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func isDirectScheme(scheme string) bool {
+	return strings.EqualFold(scheme, "direct") || strings.EqualFold(scheme, "origin")
 }
