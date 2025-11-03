@@ -262,6 +262,7 @@ func (s *Server) handleTransparentProxy(w http.ResponseWriter, r *http.Request) 
 		Method:        r.Method,
 		RobloxHost:    host,
 		Path:          path,
+		UpstreamPath:  r.URL.Path,
 		RawQuery:      r.URL.RawQuery,
 		Header:        r.Header,
 		Body:          bodyReader,

@@ -13,15 +13,20 @@ type Target struct {
 	directScheme string
 }
 
-// Resolve returns a fully-qualified URL assembled from the upstream base, path, and query string.
-func (t *Target) Resolve(host, path, rawQuery string) *url.URL {
+// Resolve returns a fully-qualified URL assembled from the upstream base.
+func (t *Target) Resolve(host, robloxPath, upstreamPath, rawQuery string) *url.URL {
 	if t.direct {
 		return &url.URL{
 			Scheme:   t.directScheme,
 			Host:     host,
-			Path:     ensureLeadingSlash(path),
+			Path:     ensureLeadingSlash(robloxPath),
 			RawQuery: rawQuery,
 		}
+	}
+
+	path := upstreamPath
+	if path == "" {
+		path = robloxPath
 	}
 
 	u := *t.base
