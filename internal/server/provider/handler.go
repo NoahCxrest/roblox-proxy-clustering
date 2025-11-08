@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,7 +11,6 @@ import (
 	"github.com/NoahCxrest/roblox-proxy-clustering/internal/config"
 	"github.com/NoahCxrest/roblox-proxy-clustering/internal/proxy"
 	"github.com/NoahCxrest/roblox-proxy-clustering/internal/upstream"
-	"github.com/NoahCxrest/roblox-proxy-clustering/internal/util"
 )
 
 const (
@@ -71,7 +71,7 @@ func (h *Handler) pickTarget(r *http.Request) (*url.URL, error) {
 		key += "?" + r.URL.RawQuery
 	}
 
-	idx := util.ConsistentIndex(key, len(h.upstreams))
+	idx := rand.Intn(len(h.upstreams))
 	base := h.upstreams[idx]
 	rel := &url.URL{Path: r.URL.Path, RawQuery: r.URL.RawQuery}
 	return base.ResolveReference(rel), nil
